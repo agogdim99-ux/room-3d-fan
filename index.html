@@ -28,10 +28,15 @@
   button:hover{background:#334155}
   button.on{background:#0369a1;border-color:#0ea5e9}
   #hide{position:absolute;right:6px;top:4px;padding:0 6px;border:0;background:none;color:#64748b}
+  #drop{position:fixed;inset:12px;border:3px dashed #38bdf8;border-radius:16px;display:none;
+    align-items:center;justify-content:center;background:rgba(11,15,20,.6);font-size:18px;color:#7dd3fc;
+    pointer-events:none}
+  #drop.show{display:flex}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="drop">여기에 놓으면 지금 시점 그대로 바꿔 보여 줍니다 (.sog .spz .ply .compressed.ply)</div>
 
 <div class="panel" id="hud">
   <button id="hide" title="접기">–</button>
@@ -47,6 +52,8 @@
 </div>
 
 <div class="panel" id="ctl">
+  <button id="open" title=".sog .spz .ply .compressed.ply 를 끌어다 놓거나 골라서 같은 시점에서 비교">파일 열기</button>
+  <input type="file" id="file" accept=".sog,.spz,.ply,.splat,.ksplat" hidden>
   <button id="home">촬영 위치로</button>
   <button id="fit">전체 보기</button>
   <button id="flip">위아래 뒤집기</button>
@@ -107,6 +114,48 @@ const spark = new SPARK.SparkRenderer({ renderer });
 scene.add(spark);
 mark("s2", "ok", "렌더러 넣기 (SparkRenderer)");
 
+// 확장자 → Spark 안쪽 형식 이름. .sog 는 pcsogszip, .compressed.ply 도 Spark 에서는 ply
+const TYPE_OF = { "compressed.ply": "ply", sog: "pcsogszip", ply: "ply", splat: "splat", ksplat: "ksplat", spz: "spz" };
+function typeOf(name) {
+  const n = name.toLowerCase();
+  const key = Object.keys(TYPE_OF).find(k => n.endsWith("." + k));
+  if (!key) throw new Error(`모르는 확장자입니다: ${name} (sog, spz, ply, compressed.ply, splat, ksplat)`);
+  return { key, type: TYPE_OF[key] };
+}
+
+let mesh = null, box = null, radius = 1, flipped = false;
+
+// 4·5. 알갱이로 풀고 크기 재기. 다른 파일을 넣어도 카메라는 그대로 두어 같은 시점에서 비교한다
+async function showSplat(name, bytes) {
+  mark("s4", "run", "알갱이로 풀기");
+  const { key, type } = typeOf(name);
+  const t0 = performance.now();
+  const next = new SPARK.SplatMesh({ fileBytes: bytes, fileType: type });
+  await next.initialized;
+  const n = next.packedSplats?.numSplats ?? next.numSplats ?? 0;
+  if (!n) throw new Error("알갱이가 0개입니다");
+  if (flipped) { next.scale.y = -1; next.scale.z = -1; }
+  if (mesh) { scene.remove(mesh); mesh.dispose?.(); }
+  mesh = next; scene.add(mesh); window.room3d && (window.room3d.mesh = mesh);
+  mark("s4", "ok", `알갱이 ${n.toLocaleString("ko-KR")}개 · ${((performance.now() - t0) / 1000).toFixed(1)}초 · ` +
+                   `${(bytes.byteLength / n).toFixed(1)}바이트/개 (${key}→${type})`);
+  // Box3.setFromObject 는 SplatMesh 에 빈 상자를 준다 → Spark 의 getBoundingBox
+  let b = null;
+  try { b = mesh.getBoundingBox(true); } catch (e) {}
+  if (!b || b.isEmpty()) {
+    mark("s5", "bad"); fail("Spark 로 크기를 못 쟀습니다. 손으로 끌어서 찾으세요.");
+    b = new THREE.Box3(new THREE.Vector3(-2, -2, -2), new THREE.Vector3(2, 2, 2));
+  } else {
+    const sz = b.getSize(new THREE.Vector3());
+    mark("s5", "ok", `크기 재기 ${sz.x.toFixed(2)} × ${sz.y.toFixed(2)} × ${sz.z.toFixed(2)}`);
+  }
+  box = b; radius = box.getSize(new THREE.Vector3()).length() / 2;
+  camera.near = Math.max(radius / 2000, 0.001); camera.far = radius * 50; camera.updateProjectionMatrix();
+  controls.maxDistance = radius * 6;
+  document.title = `${name} · 3D 장면`;
+  return n;
+}
+
 // 3. 파일 받기
 mark("s3", "run");
 let bytes;
@@ -122,38 +171,28 @@ try {
   fail(`"${SPLAT_FILE}" 를 못 받았습니다 (${e.message}).\n같은 폴더에 있는지, file:// 로 열지 않았는지, 주소 뒤에 /${SPLAT_FILE} 를 붙여 내려오는지 보세요.`);
   throw e;
 }
+try { await showSplat(SPLAT_FILE, bytes); }
+catch (e) { mark("s4", "bad"); fail("알갱이로 못 풀었습니다. " + e.message); throw e; }
 
-// 4. 알갱이로 풀기: .sog 의 Spark 안쪽 형식 이름은 pcsogszip
-const TYPE_OF = { sog: "pcsogszip", ply: "ply", splat: "splat", ksplat: "ksplat", spz: "spz" };
-mark("s4", "run");
-let mesh;
-try {
-  const ext = SPLAT_FILE.split(".").pop().toLowerCase();
-  if (!TYPE_OF[ext]) throw new Error(`모르는 확장자 .${ext}`);
-  const t0 = performance.now();
-  mesh = new SPARK.SplatMesh({ fileBytes: bytes, fileType: TYPE_OF[ext] });
-  scene.add(mesh);
-  await mesh.initialized;
-  const n = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
-  if (!n) throw new Error("알갱이가 0개입니다");
-  mark("s4", "ok", `알갱이 ${n.toLocaleString("ko-KR")}개 · ${((performance.now() - t0) / 1000).toFixed(1)}초`);
-} catch (e) {
-  mark("s4", "bad"); fail("알갱이로 못 풀었습니다. " + e.message); throw e;
+// 파일 끌어다 놓기 (또는 '파일 열기' 단추) → 지금 시점 그대로 바꿔 보여 준다
+async function openLocal(file) {
+  try {
+    const t0 = performance.now();
+    const b = new Uint8Array(await file.arrayBuffer());
+    mark("s3", "ok", `파일 열기 ${file.name} ${(b.byteLength / 1e6).toFixed(1)}MB (${b.byteLength.toLocaleString("ko-KR")}바이트) · ` +
+                     `${((performance.now() - t0) / 1000).toFixed(1)}초`);
+    el("fix").classList.remove("show");
+    await showSplat(file.name, b);
+  } catch (e) { mark("s4", "bad"); fail(`${file.name} 를 못 열었습니다. ${e.message}`); }
 }
-
-// 5. 크기 재기: Box3.setFromObject 는 SplatMesh 에 빈 상자를 준다 → Spark 의 getBoundingBox
-let box = null;
-try { box = mesh.getBoundingBox(true); } catch (e) {}
-if (!box || box.isEmpty()) {
-  mark("s5", "bad"); fail("Spark 로 크기를 못 쟀습니다. 손으로 끌어서 찾으세요.");
-  box = new THREE.Box3(new THREE.Vector3(-2, -2, -2), new THREE.Vector3(2, 2, 2));
-} else {
-  const sz = box.getSize(new THREE.Vector3());
-  mark("s5", "ok", `크기 재기 ${sz.x.toFixed(2)} × ${sz.y.toFixed(2)} × ${sz.z.toFixed(2)}`);
-}
-const radius = box.getSize(new THREE.Vector3()).length() / 2;
-camera.near = Math.max(radius / 2000, 0.001); camera.far = radius * 50; camera.updateProjectionMatrix();
-controls.maxDistance = radius * 6;
+addEventListener("dragover", e => { e.preventDefault(); el("drop").classList.add("show"); });
+addEventListener("dragleave", e => { if (!e.relatedTarget) el("drop").classList.remove("show"); });
+addEventListener("drop", e => {
+  e.preventDefault(); el("drop").classList.remove("show");
+  const f = e.dataTransfer.files[0]; if (f) openLocal(f);
+});
+el("open").onclick = () => el("file").click();
+el("file").onchange = e => { const f = e.target.files[0]; if (f) openLocal(f); e.target.value = ""; };
 
 function goHome() {   // 촬영 위치 근처에서 시작
   camera.position.fromArray(HOME_POS); controls.target.fromArray(HOME_TARGET);
@@ -171,12 +210,14 @@ goHome();
 
 el("home").onclick = goHome;
 el("fit").onclick = fitAll;
-el("flip").onclick = () => { mesh.scale.y *= -1; mesh.scale.z *= -1; mesh.updateMatrixWorld(true); };
+el("flip").onclick = () => {
+  flipped = !flipped; mesh.scale.y *= -1; mesh.scale.z *= -1; mesh.updateMatrixWorld(true);
+};
 el("spin").onclick = e => {
   controls.autoRotate = !controls.autoRotate; controls.autoRotateSpeed = 0.8;
   e.target.classList.toggle("on", controls.autoRotate);
 };
-window.room3d = { THREE, SPARK, scene, camera, controls, renderer, spark, mesh, box };
+window.room3d = { THREE, SPARK, scene, camera, controls, renderer, spark, mesh, box, openLocal, showSplat };
 
 renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
 </script>
